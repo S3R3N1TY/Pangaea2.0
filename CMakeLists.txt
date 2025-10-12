@@ -35,15 +35,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
-# TODO: VMA, ImGui (impl_glfw + impl_vulkan)
-
 # -------------------- Sources/Target --------------------
 file(GLOB_RECURSE SRC CONFIGURE_DEPENDS "src/*.cpp")
 add_executable(Pangaea2_0 ${SRC})
-
 set_target_properties(Pangaea2_0 PROPERTIES OUTPUT_NAME "Pangaea2.0")
 
-# Includes (treated vendor headers as SYSTEM to suppress warnings)
+# Includes (treats vendor headers as SYSTEM to suppress their warnings)
 target_include_directories(Pangaea2_0
   PRIVATE ${CMAKE_SOURCE_DIR}/include
   SYSTEM PRIVATE ${glm_SOURCE_DIR}
@@ -52,7 +49,7 @@ target_include_directories(Pangaea2_0
 # Link libs
 target_link_libraries(Pangaea2_0 PRIVATE glfw Vulkan::Vulkan)
 
-# Warnings per-target (no more global slap-fights)
+# Warnings per-target
 if (MSVC)
   target_compile_options(Pangaea2_0 PRIVATE /W4 /permissive- /Zc:__cplusplus /EHsc)
 else()
@@ -63,3 +60,47 @@ endif()
 if (WIN32)
   target_compile_definitions(Pangaea2_0 PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
+
+# -------------------- Shader compilation (GLSL -> SPIR-V) --------------------
+# Searches for glslc
+if (WIN32)
+  set(GLSLC "$ENV{VULKAN_SDK}/Bin/glslc.exe")
+else()
+  find_program(GLSLC glslc)
+endif()
+
+if (NOT EXISTS "${GLSLC}")
+  message(WARNING "glslc not found. Build will succeed but shaders won't auto-compile.")
+endif()
+
+set(GLSL_SOURCES
+  ${CMAKE_SOURCE_DIR}/shaders/triangle.vert
+  ${CMAKE_SOURCE_DIR}/shaders/triangle.frag
+)
+
+set(SPV_OUTPUTS "")
+foreach(SHADER ${GLSL_SOURCES})
+  get_filename_component(FILE_NAME ${SHADER} NAME)
+  set(SPV "${CMAKE_BINARY_DIR}/shaders/${FILE_NAME}.spv")
+  list(APPEND SPV_OUTPUTS ${SPV})
+
+  if (EXISTS "${GLSLC}")
+    add_custom_command(
+      OUTPUT ${SPV}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+      COMMAND ${GLSLC} ${SHADER} -o ${SPV}
+      DEPENDS ${SHADER}
+      COMMENT "Compiling ${FILE_NAME} -> SPIR-V"
+      VERBATIM
+    )
+  endif()
+endforeach()
+
+add_custom_target(Shaders DEPENDS ${SPV_OUTPUTS})
+add_dependencies(Pangaea2_0 Shaders)
+
+# Copy compiled SPIR-V next to the executable so the runtime can load them
+add_custom_command(TARGET Pangaea2_0 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:Pangaea2_0>/shaders
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_BINARY_DIR}/shaders $<TARGET_FILE_DIR:Pangaea2_0>/shaders
+)

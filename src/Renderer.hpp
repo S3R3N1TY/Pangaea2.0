@@ -32,8 +32,10 @@ private:
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
 
-    // Render pass & framebuffers
+    // Render pass, pipeline & framebuffers
     VkRenderPass renderPass{};
+    VkPipelineLayout pipelineLayout{};
+    VkPipeline graphicsPipeline{};
     std::vector<VkFramebuffer> framebuffers;
 
     // Commands
@@ -63,6 +65,7 @@ private:
     void createSwapchain();
     void createImageViews();
     void createRenderPass();
+    void createGraphicsPipeline();
     void createFramebuffers();
 
     // Commands
@@ -91,6 +94,7 @@ private:
     VkPresentModeKHR     chooseSwapPresentMode(const std::vector<VkPresentModeKHR>&);
     VkExtent2D           chooseSwapExtent(const VkSurfaceCapabilitiesKHR&);
     void                 recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
+    VkShaderModule       createShaderModule(const std::vector<char>& code);
 
     // Resize handling
     void recreateSwapchain();

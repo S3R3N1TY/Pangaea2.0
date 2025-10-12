@@ -1,9 +1,22 @@
 #include "Renderer.hpp"
+
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <stdexcept>
 #include <limits>
 #include <algorithm>
+#include <fstream>
+
+// --------- file loader ----------
+static std::vector<char> readFile(const std::string& path) {
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (!file) throw std::runtime_error("Failed to open file: " + path);
+    const size_t size = static_cast<size_t>(file.tellg());
+    std::vector<char> data(size);
+    file.seekg(0);
+    file.read(data.data(), size);
+    return data;
+}
 
 // ---------------- Debug callback ----------------
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
@@ -28,6 +41,7 @@ void Renderer::init(GLFWwindow* window) {
     createSwapchain();
     createImageViews();
     createRenderPass();
+    createGraphicsPipeline();
     createFramebuffers();
     createCommandPool();
     createCommandBuffers();
@@ -52,7 +66,7 @@ void Renderer::cleanup() {
     imageAvailableSemaphores.clear();
     inFlightFences.clear();
 
-    // Per-image semaphores
+    // Per-image semaphores (presentation waits)
     for (auto sem : renderFinishedSemaphores) {
         if (sem) vkDestroySemaphore(device, sem, nullptr);
     }
@@ -84,30 +98,25 @@ void Renderer::drawFrame() {
     // Wait for the current frame to finish
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 
-    // Acquire next image
+    // Acquire
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
         imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
 
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
-        recreateSwapchain();
-        return;
-    }
-    else if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
-        throw std::runtime_error("Failed to acquire swapchain image");
-    }
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { recreateSwapchain(); return; }
+    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) throw std::runtime_error("Failed to acquire swapchain image");
 
-    // Ensure the image isn't still in flight
+    // Ensure not still in flight
     if (imagesInFlight[imageIndex] != VK_NULL_HANDLE) {
         vkWaitForFences(device, 1, &imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
     }
     imagesInFlight[imageIndex] = inFlightFences[currentFrame];
 
-    // Re-record for this image
+    // Record commands
     vkResetCommandBuffer(commandBuffers[imageIndex], 0);
     recordCommandBuffer(commandBuffers[imageIndex], imageIndex);
 
-    // Submit, signaling the per-image semaphore
+    // Submit, signal per-image semaphore
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.waitSemaphoreCount = 1;
@@ -120,9 +129,9 @@ void Renderer::drawFrame() {
 
     vkResetFences(device, 1, &inFlightFences[currentFrame]);
     if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS)
-        throw std::runtime_error("Failed to submit draw command buffer");
+        throw std::runtime_error("Failed to submit draw");
 
-    // Present waits on that same per-image semaphore
+    // Present waits on same per-image semaphore
     VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     presentInfo.waitSemaphoreCount = 1;
     presentInfo.pWaitSemaphores = &renderFinishedSemaphores[imageIndex];
@@ -136,7 +145,7 @@ void Renderer::drawFrame() {
         recreateSwapchain();
     }
     else if (pres != VK_SUCCESS) {
-        throw std::runtime_error("Failed to present swapchain image");
+        throw std::runtime_error("Failed to present");
     }
 
     currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -261,10 +270,7 @@ void Renderer::pickPhysicalDevice() {
     vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
 
     for (auto dev : devices) {
-        if (isDeviceSuitable(dev)) {
-            physicalDevice = dev;
-            break;
-        }
+        if (isDeviceSuitable(dev)) { physicalDevice = dev; break; }
     }
     if (physicalDevice == VK_NULL_HANDLE) throw std::runtime_error("No suitable GPU found");
 }
@@ -441,6 +447,106 @@ void Renderer::createRenderPass() {
         throw std::runtime_error("Failed to create render pass");
 }
 
+VkShaderModule Renderer::createShaderModule(const std::vector<char>& code) {
+    VkShaderModuleCreateInfo info{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    info.codeSize = code.size();
+    info.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+    VkShaderModule module{};
+    if (vkCreateShaderModule(device, &info, nullptr, &module) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create shader module");
+    return module;
+}
+
+void Renderer::createGraphicsPipeline() {
+    // Load SPIR-V placed by CMake next to the exe: ./shaders/*.spv
+    const std::string base = "shaders/";
+    auto vertCode = readFile(base + "triangle.vert.spv");
+    auto fragCode = readFile(base + "triangle.frag.spv");
+
+    VkShaderModule vertModule = createShaderModule(vertCode);
+    VkShaderModule fragModule = createShaderModule(fragCode);
+
+    VkPipelineShaderStageCreateInfo vertStage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStage.module = vertModule;
+    vertStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fragStage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+    fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragStage.module = fragModule;
+    fragStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo stages[] = { vertStage, fragStage };
+
+    // No vertex buffers; uses gl_VertexIndex in the shader
+    VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    VkViewport viewport{};
+    viewport.x = 0.0f; viewport.y = 0.0f;
+    viewport.width = static_cast<float>(swapchainExtent.width);
+    viewport.height = static_cast<float>(swapchainExtent.height);
+    viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{ {0,0}, swapchainExtent };
+
+    VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    viewportState.viewportCount = 1; viewportState.pViewports = &viewport;
+    viewportState.scissorCount = 1; viewportState.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    raster.depthClampEnable = VK_FALSE;
+    raster.rasterizerDiscardEnable = VK_FALSE;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_BACK_BIT;
+    raster.frontFace = VK_FRONT_FACE_CLOCKWISE; // with screen-space verts this is fine for now
+    raster.depthBiasEnable = VK_FALSE;
+    raster.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo msaa{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    msaa.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &colorBlendAttachment;
+
+    VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create pipeline layout");
+
+    VkGraphicsPipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    pipeInfo.stageCount = 2;
+    pipeInfo.pStages = stages;
+    pipeInfo.pVertexInputState = &vertexInput;
+    pipeInfo.pInputAssemblyState = &inputAssembly;
+    pipeInfo.pViewportState = &viewportState;
+    pipeInfo.pRasterizationState = &raster;
+    pipeInfo.pMultisampleState = &msaa;
+    pipeInfo.pDepthStencilState = nullptr;
+    pipeInfo.pColorBlendState = &colorBlend;
+    pipeInfo.pDynamicState = nullptr;
+    pipeInfo.layout = pipelineLayout;
+    pipeInfo.renderPass = renderPass;
+    pipeInfo.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &graphicsPipeline) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create graphics pipeline");
+
+    // modules no longer needed
+    vkDestroyShaderModule(device, fragModule, nullptr);
+    vkDestroyShaderModule(device, vertModule, nullptr);
+}
+
 void Renderer::createFramebuffers() {
     framebuffers.resize(swapchainImageViews.size());
     for (size_t i = 0; i < swapchainImageViews.size(); ++i) {
@@ -483,7 +589,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
         throw std::runtime_error("Failed to begin command buffer");
 
     VkClearValue clear{};
-    clear.color = { { 0.07f, 0.17f, 0.33f, 1.0f } };
+    clear.color = { { 0.07f, 0.17f, 0.33f, 1.0f } }; // background
 
     VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = renderPass;
@@ -494,6 +600,8 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     rp.pClearValues = &clear;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+    vkCmdDraw(cmd, 3, 1, 0, 0); // the triangle
     vkCmdEndRenderPass(cmd);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
@@ -525,10 +633,7 @@ void Renderer::createSyncObjects() {
 
 // Create per-image semaphores; call on first init and after swapchain recreation
 void Renderer::recreatePerImageSemaphores() {
-    // destroy old if any
-    for (auto s : renderFinishedSemaphores)
-        if (s) vkDestroySemaphore(device, s, nullptr);
-
+    for (auto s : renderFinishedSemaphores) if (s) vkDestroySemaphore(device, s, nullptr);
     renderFinishedSemaphores.clear();
     renderFinishedSemaphores.resize(swapchainImages.size());
 
@@ -541,6 +646,9 @@ void Renderer::recreatePerImageSemaphores() {
 }
 
 void Renderer::destroySwapchainObjects() {
+    if (graphicsPipeline) { vkDestroyPipeline(device, graphicsPipeline, nullptr); graphicsPipeline = VK_NULL_HANDLE; }
+    if (pipelineLayout) { vkDestroyPipelineLayout(device, pipelineLayout, nullptr); pipelineLayout = VK_NULL_HANDLE; }
+
     for (auto fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
     framebuffers.clear();
 
@@ -561,12 +669,11 @@ void Renderer::destroySwapchainObjects() {
 
 // Full swapchain recreation on resize or OUT_OF_DATE
 void Renderer::recreateSwapchain() {
-    // Handle minimized windows: wait until there is a non-zero framebuffer
+    // Handle minimized windows
     int width = 0, height = 0;
     do {
         glfwGetFramebufferSize(windowHandle, &width, &height);
-        if (width == 0 || height == 0)
-            glfwWaitEvents();
+        if (width == 0 || height == 0) glfwWaitEvents();
     } while (width == 0 || height == 0);
 
     vkDeviceWaitIdle(device);
@@ -576,9 +683,9 @@ void Renderer::recreateSwapchain() {
     createSwapchain();
     createImageViews();
     createRenderPass();
+    createGraphicsPipeline();
     createFramebuffers();
-    // command buffers depend on framebuffer count
-    createCommandBuffers();
+    createCommandBuffers();     // depends on framebuffer count
 
     // per-image semaphores depend on swapchain image count
     recreatePerImageSemaphores();
