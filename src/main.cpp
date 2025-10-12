@@ -4,7 +4,6 @@
 
 static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
     (void)width; (void)height;
-    // Store a pointer to Renderer in the window user pointer
     auto renderer = reinterpret_cast<Renderer*>(glfwGetWindowUserPointer(window));
     if (renderer) renderer->setFramebufferResized(true);
 }

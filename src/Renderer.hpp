@@ -2,6 +2,7 @@
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <optional>
+#include <chrono>
 
 struct GLFWwindow;
 
@@ -11,7 +12,6 @@ public:
     void cleanup();
     void drawFrame();
 
-    // Call from the GLFW resize callback
     void setFramebufferResized(bool v) { framebufferResized = v; }
 
 private:
@@ -32,11 +32,35 @@ private:
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
 
+    // Depth
+    VkImage        depthImage{};
+    VkDeviceMemory depthImageMemory{};
+    VkImageView    depthImageView{};
+    VkFormat       depthFormat{};
+
     // Render pass, pipeline & framebuffers
     VkRenderPass renderPass{};
+    VkDescriptorSetLayout descriptorSetLayout{};
     VkPipelineLayout pipelineLayout{};
     VkPipeline graphicsPipeline{};
     std::vector<VkFramebuffer> framebuffers;
+
+    // Buffers: vertex/index
+    VkBuffer vertexBuffer{};
+    VkDeviceMemory vertexBufferMemory{};
+    VkBuffer indexBuffer{};
+    VkDeviceMemory indexBufferMemory{};
+
+    // Uniforms: per swapchain image
+    struct UniformBufferObject {
+        float mvp[16]; // raw 4x4 column-major
+    };
+    std::vector<VkBuffer>       uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void*>          uniformBuffersMapped;
+
+    VkDescriptorPool descriptorPool{};
+    std::vector<VkDescriptorSet> descriptorSets;
 
     // Commands
     VkCommandPool commandPool{};
@@ -52,6 +76,9 @@ private:
 
     bool framebufferResized = false;
 
+    // Time
+    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
+
 private:
     // Setup
     void createInstance();
@@ -65,8 +92,18 @@ private:
     void createSwapchain();
     void createImageViews();
     void createRenderPass();
+    void createDescriptorSetLayout();
+    void createDepthResources();
     void createGraphicsPipeline();
     void createFramebuffers();
+
+    // Resources
+    void createVertexBuffer();
+    void createIndexBuffer();
+    void createUniformBuffers();
+    void updateUniformBuffer(uint32_t imageIndex);
+    void createDescriptorPool();
+    void createDescriptorSets();
 
     // Commands
     void createCommandPool();
@@ -95,6 +132,21 @@ private:
     VkExtent2D           chooseSwapExtent(const VkSurfaceCapabilitiesKHR&);
     void                 recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
     VkShaderModule       createShaderModule(const std::vector<char>& code);
+
+    // Images & buffers
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags props);
+    void createImage(uint32_t w, uint32_t h, VkFormat format, VkImageTiling tiling,
+        VkImageUsageFlags usage, VkMemoryPropertyFlags props,
+        VkImage& image, VkDeviceMemory& memory);
+    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect);
+    VkFormat findDepthFormat();
+    bool hasStencilComponent(VkFormat format);
+
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+        VkBuffer& buffer, VkDeviceMemory& memory);
+    void copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size);
+    VkCommandBuffer beginSingleTimeCommands();
+    void endSingleTimeCommands(VkCommandBuffer cmd);
 
     // Resize handling
     void recreateSwapchain();

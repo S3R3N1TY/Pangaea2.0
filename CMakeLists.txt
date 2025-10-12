@@ -40,7 +40,7 @@ file(GLOB_RECURSE SRC CONFIGURE_DEPENDS "src/*.cpp")
 add_executable(Pangaea2_0 ${SRC})
 set_target_properties(Pangaea2_0 PROPERTIES OUTPUT_NAME "Pangaea2.0")
 
-# Includes (treats vendor headers as SYSTEM to suppress their warnings)
+# Includes (treat vendor headers as SYSTEM to hush their warnings)
 target_include_directories(Pangaea2_0
   PRIVATE ${CMAKE_SOURCE_DIR}/include
   SYSTEM PRIVATE ${glm_SOURCE_DIR}
@@ -62,7 +62,6 @@ if (WIN32)
 endif()
 
 # -------------------- Shader compilation (GLSL -> SPIR-V) --------------------
-# Searches for glslc
 if (WIN32)
   set(GLSLC "$ENV{VULKAN_SDK}/Bin/glslc.exe")
 else()
@@ -83,7 +82,6 @@ foreach(SHADER ${GLSL_SOURCES})
   get_filename_component(FILE_NAME ${SHADER} NAME)
   set(SPV "${CMAKE_BINARY_DIR}/shaders/${FILE_NAME}.spv")
   list(APPEND SPV_OUTPUTS ${SPV})
-
   if (EXISTS "${GLSLC}")
     add_custom_command(
       OUTPUT ${SPV}
@@ -99,7 +97,7 @@ endforeach()
 add_custom_target(Shaders DEPENDS ${SPV_OUTPUTS})
 add_dependencies(Pangaea2_0 Shaders)
 
-# Copy compiled SPIR-V next to the executable so the runtime can load them
+# Copies compiled SPIR-V next to the executable so the runtime can load them
 add_custom_command(TARGET Pangaea2_0 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:Pangaea2_0>/shaders
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_BINARY_DIR}/shaders $<TARGET_FILE_DIR:Pangaea2_0>/shaders
