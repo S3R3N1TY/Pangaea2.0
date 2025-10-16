@@ -4,6 +4,8 @@
 #include <vector>
 #include <optional>
 #include <chrono>
+#include <array>
+#include <stdexcept>
 
 struct GLFWwindow;
 
@@ -52,12 +54,11 @@ private:
     VmaAllocation  indexAlloc{};
 
     // Uniforms: per swapchain image
-    struct UniformBufferObject { float mvp[16]; };
+    struct UniformBufferObject { float vp[16]; };
     std::vector<VkBuffer>      uniformBuffers;
     std::vector<VmaAllocation> uniformAllocs;
     std::vector<void*>         uniformMapped;
 
-    VkDescriptorPool descriptorPool{};
     std::vector<VkDescriptorSet> descriptorSets;
 
     // Commands
@@ -99,7 +100,6 @@ private:
     void createIndexBuffer();
     void createUniformBuffers();
     void updateUniformBuffer(uint32_t imageIndex);
-    void createDescriptorPool();
     void createDescriptorSets();
 
     // Commands
@@ -166,6 +166,78 @@ private:
     // Device-local buffer creation helper (no mapping)
     void createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
         VkBuffer& buffer, VmaAllocation& alloc);
+
+    // ---------------- Descriptor arena (auto-growing pools) ----------------
+    struct DescriptorArena {
+        VkDevice device = VK_NULL_HANDLE;
+        uint32_t maxSetsPerPool = 256; // grow in chunks
+
+        std::vector<VkDescriptorPool> pools;
+
+        void init(VkDevice dev) { device = dev; }
+        void destroy() {
+            for (auto p : pools) if (p) vkDestroyDescriptorPool(device, p, nullptr);
+            pools.clear();
+            device = VK_NULL_HANDLE;
+        }
+        // Reset all pools so their sets become invalid, ready for re-allocation.
+        // Use this on swapchain rebuild, or at frame-begin if you switch to per-frame sets.
+        void reset() {
+            for (auto p : pools) if (p) vkResetDescriptorPool(device, p, 0);
+        }
+
+        VkDescriptorSet allocate(VkDescriptorSetLayout layout) {
+            if (pools.empty()) pools.push_back(createPool());
+
+            VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            ai.descriptorPool = pools.back();
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &layout;
+
+            VkDescriptorSet set{};
+            VkResult r = vkAllocateDescriptorSets(device, &ai, &set);
+            if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
+                pools.push_back(createPool());
+                ai.descriptorPool = pools.back();
+                VK_CHECK(vkAllocateDescriptorSets(device, &ai, &set));
+            }
+            else {
+                VK_CHECK(r);
+            }
+            return set;
+        }
+
+    private:
+        // Tiny helper so we can write VK_CHECK above without littering the class
+        static void VK_CHECK(VkResult res) {
+            if (res != VK_SUCCESS) throw std::runtime_error("DescriptorArena: VkResult != VK_SUCCESS");
+        }
+
+        VkDescriptorPool createPool() {
+            // Generous defaults so you don’t babysit counts. Tune later if needed.
+            std::array<VkDescriptorPoolSize, 5> sizes{ {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         maxSetsPerPool },
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxSetsPerPool },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         maxSetsPerPool / 2 },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,   maxSetsPerPool / 4 },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          maxSetsPerPool / 4 },
+            } };
+
+            VkDescriptorPoolCreateInfo info{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; // nice to have
+            info.maxSets = maxSetsPerPool * 2; // headroom
+            info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+            info.pPoolSizes = sizes.data();
+
+            VkDescriptorPool pool{};
+            if (vkCreateDescriptorPool(device, &info, nullptr, &pool) != VK_SUCCESS) {
+                throw std::runtime_error("DescriptorArena: failed to create descriptor pool");
+            }
+            return pool;
+        }
+    };
+
+    DescriptorArena descriptorArena;
 
 
     // Images & buffers

@@ -115,7 +115,7 @@ void Renderer::init(GLFWwindow* window) {
 
     // --- Per-swapchain-image resources ---
     createUniformBuffers();
-    createDescriptorPool();
+    descriptorArena.init(device);
     createDescriptorSets();
 
     createCommandBuffers();
@@ -131,6 +131,7 @@ void Renderer::cleanup() {
     if (vertexBuffer) { vmaDestroyBuffer(allocator, vertexBuffer, vertexAlloc); vertexBuffer = VK_NULL_HANDLE; }
 
     destroySwapchainObjects();
+    descriptorArena.destroy();
 
     if (descriptorSetLayout) {
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
@@ -158,6 +159,17 @@ void Renderer::cleanup() {
     }
     renderFinishedSemaphores.clear();
     imagesInFlight.clear();
+
+    for (size_t i = 0; i < uniformBuffers.size(); ++i) {
+        if (uniformBuffers[i]) {
+            vmaDestroyBuffer(allocator, uniformBuffers[i], uniformAllocs[i]);
+            uniformBuffers[i] = VK_NULL_HANDLE;
+            uniformAllocs[i] = VK_NULL_HANDLE;
+        }
+    }
+    uniformBuffers.clear();
+    uniformAllocs.clear();
+    uniformMapped.clear();
 
     if (allocator) {
         vmaDestroyAllocator(allocator);
@@ -701,9 +713,17 @@ void Renderer::createGraphicsPipeline() {
     colorBlend.attachmentCount = 1;
     colorBlend.pAttachments = &colorBlendAttachment;
 
+    VkPushConstantRange pc{};
+    pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pc.offset = 0;
+    pc.size = sizeof(glm::mat4); // 64 bytes
+
     VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &descriptorSetLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pc;
+
     if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS)
         throw std::runtime_error("Failed to create pipeline layout");
 
@@ -835,12 +855,22 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     // Pipeline + descriptors + draws
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
+    // Bind geometry
     VkDeviceSize offsets[] = { 0 };
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, offsets);
     vkCmdBindIndexBuffer(cmd, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
-        &descriptorSets[imageIndex], 0, nullptr);
 
+    // Bind per-frame descriptor set
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
+        &descriptorSets[currentFrame], 0, nullptr);
+
+    // Build per-object model matrix and push it
+    float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime).count();
+    glm::mat4 model = glm::rotate(glm::mat4(1.0f), t, glm::vec3(0.f, 0.f, 1.f));
+
+    vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &model);
+
+    // Draw
     vkCmdDrawIndexed(cmd, static_cast<uint32_t>(gIndices.size()), 1, 0, 0, 0);
 
     vkCmdEndRendering(cmd);
@@ -911,17 +941,7 @@ void Renderer::destroySwapchainObjects() {
         vkFreeCommandBuffers(device, commandPool,
             static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
         commandBuffers.clear();
-        
     }
-    if (descriptorPool) { vkDestroyDescriptorPool(device, descriptorPool, nullptr); descriptorPool = VK_NULL_HANDLE; }
-
-    for (size_t i = 0; i < uniformBuffers.size(); ++i) {
-        if (uniformBuffers[i])  vmaDestroyBuffer(allocator, uniformBuffers[i], uniformAllocs[i]);
-    }
-    uniformBuffers.clear();
-    uniformAllocs.clear();
-    uniformMapped.clear();
-    descriptorSets.clear();
 
     if (graphicsPipeline) { vkDestroyPipeline(device, graphicsPipeline, nullptr); graphicsPipeline = VK_NULL_HANDLE; }
     if (pipelineLayout) { vkDestroyPipelineLayout(device, pipelineLayout, nullptr); pipelineLayout = VK_NULL_HANDLE; }
@@ -955,10 +975,6 @@ void Renderer::recreateSwapchain() {
     createImageViews();
     createDepthResources();      // <-- before render pass
     createGraphicsPipeline();
-
-    createUniformBuffers();
-    createDescriptorPool();
-    createDescriptorSets();
 
     createCommandBuffers();
     recreatePerImageSemaphores();
@@ -1183,21 +1199,25 @@ void Renderer::createIndexBuffer() {
 
 void Renderer::createUniformBuffers() {
     const VkDeviceSize size = sizeof(UniformBufferObject);
-    uniformBuffers.resize(swapchainImages.size());
-    uniformAllocs.resize(swapchainImages.size());
-    uniformMapped.resize(swapchainImages.size());
+    uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+    uniformAllocs.resize(MAX_FRAMES_IN_FLIGHT);
+    uniformMapped.resize(MAX_FRAMES_IN_FLIGHT);
 
-    for (size_t i = 0; i < swapchainImages.size(); ++i) {
+    for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         void* mapped = nullptr;
         createBuffer(size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, uniformBuffers[i], uniformAllocs[i], &mapped);
         uniformMapped[i] = mapped;
     }
 }
 
-void Renderer::updateUniformBuffer(uint32_t imageIndex) {
+void Renderer::updateUniformBuffer(uint32_t /*imageIndex*/) {
+    // Use currentFrame for per-frame UBO indexing
+    const uint32_t idx = currentFrame;
+
+    // Time
     float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime).count();
 
-    glm::mat4 model = glm::rotate(glm::mat4(1.0f), t, glm::vec3(0.f, 0.f, 1.f));
+    // Camera
     glm::mat4 view = glm::lookAt(glm::vec3(0.f, 0.f, 1.5f),
         glm::vec3(0.f, 0.f, 0.f),
         glm::vec3(0.f, 1.f, 0.f));
@@ -1205,43 +1225,21 @@ void Renderer::updateUniformBuffer(uint32_t imageIndex) {
     glm::mat4 proj = glm::perspective(glm::radians(60.f), aspect, 0.01f, 10.f);
     proj[1][1] *= -1.f;
 
-    glm::mat4 mvp = proj * view * model;
+    glm::mat4 vp = proj * view;
 
     UniformBufferObject u{};
-    std::memcpy(u.mvp, &mvp[0][0], sizeof(u.mvp));
+    std::memcpy(u.vp, &vp[0][0], sizeof(u.vp));
 
-    // Persistently mapped UBO: write then FLUSH
-    std::memcpy(uniformMapped[imageIndex], &u, sizeof(u));
-    vmaFlushAllocation(allocator, uniformAllocs[imageIndex], 0, sizeof(u));
+    std::memcpy(uniformMapped[idx], &u, sizeof(u));
+    vmaFlushAllocation(allocator, uniformAllocs[idx], 0, sizeof(u));
 }
 
-
-void Renderer::createDescriptorPool() {
-    VkDescriptorPoolSize pool{};
-    pool.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool.descriptorCount = static_cast<uint32_t>(swapchainImages.size());
-
-    VkDescriptorPoolCreateInfo info{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    info.poolSizeCount = 1;
-    info.pPoolSizes = &pool;
-    info.maxSets = static_cast<uint32_t>(swapchainImages.size());
-
-    if (vkCreateDescriptorPool(device, &info, nullptr, &descriptorPool) != VK_SUCCESS)
-        throw std::runtime_error("Failed to create descriptor pool");
-}
 
 void Renderer::createDescriptorSets() {
-    std::vector<VkDescriptorSetLayout> layouts(swapchainImages.size(), descriptorSetLayout);
-    VkDescriptorSetAllocateInfo alloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    alloc.descriptorPool = descriptorPool;
-    alloc.descriptorSetCount = static_cast<uint32_t>(layouts.size());
-    alloc.pSetLayouts = layouts.data();
+    descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+    for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        descriptorSets[i] = descriptorArena.allocate(descriptorSetLayout);
 
-    descriptorSets.resize(layouts.size());
-    if (vkAllocateDescriptorSets(device, &alloc, descriptorSets.data()) != VK_SUCCESS)
-        throw std::runtime_error("Failed to allocate descriptor sets");
-
-    for (size_t i = 0; i < descriptorSets.size(); ++i) {
         VkDescriptorBufferInfo buf{};
         buf.buffer = uniformBuffers[i];
         buf.offset = 0;
