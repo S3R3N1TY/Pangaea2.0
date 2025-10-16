@@ -41,11 +41,9 @@ private:
     VkFormat       depthFormat{};
 
     // Render pass, pipeline & framebuffers
-    VkRenderPass renderPass{};
     VkDescriptorSetLayout descriptorSetLayout{};
     VkPipelineLayout pipelineLayout{};
     VkPipeline graphicsPipeline{};
-    std::vector<VkFramebuffer> framebuffers;
 
     // Buffers: vertex/index
     VkBuffer       vertexBuffer{};
@@ -92,11 +90,9 @@ private:
     // Swapchain pipeline
     void createSwapchain();
     void createImageViews();
-    void createRenderPass();
     void createDescriptorSetLayout();
     void createDepthResources();
     void createGraphicsPipeline();
-    void createFramebuffers();
 
     // Resources
     void createVertexBuffer();
@@ -133,6 +129,44 @@ private:
     VkExtent2D           chooseSwapExtent(const VkSurfaceCapabilitiesKHR&);
     void                 recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
     VkShaderModule       createShaderModule(const std::vector<char>& code);
+
+    // ---------------- Staging uploader ----------------
+    struct StagingUploader {
+        // External deps
+        VmaAllocator allocator = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        VkCommandPool cmdPool = VK_NULL_HANDLE;
+
+        // Reusable staging buffer
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        VkDeviceSize capacity = 0;
+
+        // Per-upload fence
+        VkFence copyFence = VK_NULL_HANDLE;
+
+        void init(VmaAllocator alloc, VkDevice dev, VkQueue q, VkCommandPool pool, VkDeviceSize initialCapacity);
+        void destroy();
+
+        // Ensures capacity >= requiredBytes, reallocating if needed which keeps mapping persistent
+        void ensureCapacity(VkDeviceSize requiredBytes);
+
+        // Blocking upload: memcpy to staging, flush, record copy, submit, wait on fence
+        void upload(const void* src, VkDeviceSize sizeBytes, VkBuffer dst, VkDeviceSize dstOffset);
+
+    private:
+        VkCommandBuffer allocateOneShotCmd() const;
+        void submitAndWait(VkCommandBuffer cmd);
+    };
+
+    StagingUploader uploader;
+
+    // Device-local buffer creation helper (no mapping)
+    void createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+        VkBuffer& buffer, VmaAllocation& alloc);
+
 
     // Images & buffers
     VkFormat findDepthFormat();
