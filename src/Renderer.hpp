@@ -1,5 +1,6 @@
 #pragma once
 #include <vulkan/vulkan.h>
+#include <vk_mem_alloc.h>
 #include <vector>
 #include <optional>
 #include <chrono>
@@ -21,6 +22,7 @@ private:
     VkSurfaceKHR surface{};
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device{};
+    VmaAllocator allocator = VK_NULL_HANDLE;
     VkQueue graphicsQueue{};
     VkQueue presentQueue{};
     GLFWwindow* windowHandle = nullptr;
@@ -34,7 +36,7 @@ private:
 
     // Depth
     VkImage        depthImage{};
-    VkDeviceMemory depthImageMemory{};
+    VmaAllocation  depthAlloc{};
     VkImageView    depthImageView{};
     VkFormat       depthFormat{};
 
@@ -46,18 +48,16 @@ private:
     std::vector<VkFramebuffer> framebuffers;
 
     // Buffers: vertex/index
-    VkBuffer vertexBuffer{};
-    VkDeviceMemory vertexBufferMemory{};
-    VkBuffer indexBuffer{};
-    VkDeviceMemory indexBufferMemory{};
+    VkBuffer       vertexBuffer{};
+    VmaAllocation  vertexAlloc{};
+    VkBuffer       indexBuffer{};
+    VmaAllocation  indexAlloc{};
 
     // Uniforms: per swapchain image
-    struct UniformBufferObject {
-        float mvp[16]; // raw 4x4 column-major
-    };
-    std::vector<VkBuffer>       uniformBuffers;
-    std::vector<VkDeviceMemory> uniformBuffersMemory;
-    std::vector<void*>          uniformBuffersMapped;
+    struct UniformBufferObject { float mvp[16]; };
+    std::vector<VkBuffer>      uniformBuffers;
+    std::vector<VmaAllocation> uniformAllocs;
+    std::vector<void*>         uniformMapped;
 
     VkDescriptorPool descriptorPool{};
     std::vector<VkDescriptorSet> descriptorSets;
@@ -87,6 +87,7 @@ private:
     void createSurface();
     void pickPhysicalDevice();
     void createLogicalDevice();
+    void createAllocator(); // VMA
 
     // Swapchain pipeline
     void createSwapchain();
@@ -134,16 +135,17 @@ private:
     VkShaderModule       createShaderModule(const std::vector<char>& code);
 
     // Images & buffers
-    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags props);
-    void createImage(uint32_t w, uint32_t h, VkFormat format, VkImageTiling tiling,
-        VkImageUsageFlags usage, VkMemoryPropertyFlags props,
-        VkImage& image, VkDeviceMemory& memory);
-    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect);
     VkFormat findDepthFormat();
     bool hasStencilComponent(VkFormat format);
 
-    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
-        VkBuffer& buffer, VkDeviceMemory& memory);
+    // VMA versions
+    void createImage(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
+        VkImage& image, VmaAllocation& alloc);
+    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect);
+
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+        VkBuffer& buffer, VmaAllocation& alloc, void** mapped = nullptr);
+
     void copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size);
     VkCommandBuffer beginSingleTimeCommands();
     void endSingleTimeCommands(VkCommandBuffer cmd);

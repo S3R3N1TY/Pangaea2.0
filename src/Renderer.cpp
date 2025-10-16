@@ -38,6 +38,21 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     return VK_FALSE;
 }
 
+static bool hasInstanceExtension(const char* name) {
+    uint32_t n = 0; vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> exts(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, exts.data());
+    for (auto& e : exts) if (std::strcmp(e.extensionName, name) == 0) return true;
+    return false;
+}
+static bool hasLayer(const char* name) {
+    uint32_t n = 0; vkEnumerateInstanceLayerProperties(&n, nullptr);
+    std::vector<VkLayerProperties> layers(n);
+    vkEnumerateInstanceLayerProperties(&n, layers.data());
+    for (auto& l : layers) if (std::strcmp(l.layerName, name) == 0) return true;
+    return false;
+}
+
 // ---------------- Vertex data ----------------
 struct Vertex {
     glm::vec3 pos;
@@ -58,23 +73,23 @@ void Renderer::init(GLFWwindow* window) {
     createSurface();
     pickPhysicalDevice();
     createLogicalDevice();
+    createAllocator();       // VMA
+    createCommandPool();     // needed for staging and one-shot cmds
 
-    createCommandPool(); // needed for staging copies
-
-    // Swapchain-dependent stuff
+    // --- Swapchain-dependent setup (correct order so depthFormat is known) ---
     createSwapchain();
     createImageViews();
+    createDepthResources();      // <-- moved before render pass
     createRenderPass();
-    createDescriptorSetLayout();
-    createDepthResources();
+    createDescriptorSetLayout(); // created once for lifetime of renderer
     createGraphicsPipeline();
     createFramebuffers();
 
-    // Resources that don't depend on swapchain count
+    // --- Resources not tied to swapchain count ---
     createVertexBuffer();
     createIndexBuffer();
 
-    // Uniforms and descriptors depend on swapchain count
+    // --- Per-swapchain-image resources ---
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
@@ -83,14 +98,13 @@ void Renderer::init(GLFWwindow* window) {
     createSyncObjects();
 }
 
+
 void Renderer::cleanup() {
     vkDeviceWaitIdle(device);
 
     // global non-swapchain resources
-    if (indexBuffer) { vkDestroyBuffer(device, indexBuffer, nullptr); indexBuffer = VK_NULL_HANDLE; }
-    if (indexBufferMemory) { vkFreeMemory(device, indexBufferMemory, nullptr); indexBufferMemory = VK_NULL_HANDLE; }
-    if (vertexBuffer) { vkDestroyBuffer(device, vertexBuffer, nullptr); vertexBuffer = VK_NULL_HANDLE; }
-    if (vertexBufferMemory) { vkFreeMemory(device, vertexBufferMemory, nullptr); vertexBufferMemory = VK_NULL_HANDLE; }
+    if (indexBuffer) { vmaDestroyBuffer(allocator, indexBuffer, indexAlloc); indexBuffer = VK_NULL_HANDLE; }
+    if (vertexBuffer) { vmaDestroyBuffer(allocator, vertexBuffer, vertexAlloc); vertexBuffer = VK_NULL_HANDLE; }
 
     destroySwapchainObjects();
 
@@ -119,6 +133,11 @@ void Renderer::cleanup() {
     renderFinishedSemaphores.clear();
     imagesInFlight.clear();
 
+    if (allocator) {
+        vmaDestroyAllocator(allocator);
+        allocator = VK_NULL_HANDLE;
+    }
+
     if (device) {
         vkDestroyDevice(device, nullptr);
         device = VK_NULL_HANDLE;
@@ -141,10 +160,8 @@ void Renderer::cleanup() {
 }
 
 void Renderer::drawFrame() {
-    // Waits for the current frame to finish
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 
-    // Acquires
     uint32_t imageIndex = 0;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
         imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
@@ -152,20 +169,16 @@ void Renderer::drawFrame() {
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) { recreateSwapchain(); return; }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) throw std::runtime_error("Failed to acquire swapchain image");
 
-    // Ensures not still in flight
     if (imagesInFlight[imageIndex] != VK_NULL_HANDLE) {
         vkWaitForFences(device, 1, &imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
     }
     imagesInFlight[imageIndex] = inFlightFences[currentFrame];
 
-    // Updates per-image UBO
     updateUniformBuffer(imageIndex);
 
-    // Records commands
     vkResetCommandBuffer(commandBuffers[imageIndex], 0);
     recordCommandBuffer(commandBuffers[imageIndex], imageIndex);
 
-    // Submits, signals per-image semaphore
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.waitSemaphoreCount = 1;
@@ -180,7 +193,6 @@ void Renderer::drawFrame() {
     if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS)
         throw std::runtime_error("Failed to submit draw");
 
-    // Present waits on same per-image semaphore
     VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     presentInfo.waitSemaphoreCount = 1;
     presentInfo.pWaitSemaphores = &renderFinishedSemaphores[imageIndex];
@@ -212,24 +224,31 @@ void Renderer::createInstance() {
     uint32_t glfwExtCount = 0;
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtCount);
     std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtCount);
-    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+    bool wantDebug = hasLayer("VK_LAYER_KHRONOS_validation") && hasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (wantDebug) {
+        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
 
     VkInstanceCreateInfo createInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     createInfo.pApplicationInfo = &appInfo;
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
 
-    const std::vector<const char*> validationLayers = { "VK_LAYER_KHRONOS_validation" };
-    createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
-    createInfo.ppEnabledLayerNames = validationLayers.data();
-
-    VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
-    populateDebugMessengerCreateInfo(debugCreateInfo);
-    createInfo.pNext = &debugCreateInfo;
+    std::vector<const char*> layers;
+    if (wantDebug) {
+        layers.push_back("VK_LAYER_KHRONOS_validation");
+        VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
+        populateDebugMessengerCreateInfo(debugCreateInfo);
+        createInfo.pNext = &debugCreateInfo;
+    }
+    createInfo.enabledLayerCount = static_cast<uint32_t>(layers.size());
+    createInfo.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
 
     if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS)
         throw std::runtime_error("Failed to create Vulkan instance");
 }
+
 
 void Renderer::populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& createInfo) {
     createInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
@@ -353,16 +372,25 @@ void Renderer::createLogicalDevice() {
     createInfo.pEnabledFeatures = &features;
     createInfo.enabledExtensionCount = 1;
     createInfo.ppEnabledExtensionNames = deviceExtensions;
-
-    const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
-    createInfo.enabledLayerCount = 1;
-    createInfo.ppEnabledLayerNames = layers;
+    createInfo.enabledLayerCount = 0;
+    createInfo.ppEnabledLayerNames = nullptr;
 
     if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS)
         throw std::runtime_error("Failed to create logical device");
 
     vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
+}
+
+void Renderer::createAllocator() {
+    VmaAllocatorCreateInfo info{};
+    info.flags = VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    info.instance = instance;
+    info.physicalDevice = physicalDevice;
+    info.device = device;
+    info.vulkanApiVersion = VK_API_VERSION_1_3;
+    if (vmaCreateAllocator(&info, &allocator) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create VMA allocator");
 }
 
 VkSurfaceFormatKHR Renderer::chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) {
@@ -478,45 +506,25 @@ bool Renderer::hasStencilComponent(VkFormat format) {
     return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
 }
 
-uint32_t Renderer::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags props) {
-    VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((typeFilter & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & props) == props) {
-            return i;
-        }
-    }
-    throw std::runtime_error("Failed to find suitable memory type");
-}
-
-void Renderer::createImage(uint32_t w, uint32_t h, VkFormat format, VkImageTiling tiling,
-    VkImageUsageFlags usage, VkMemoryPropertyFlags props,
-    VkImage& image, VkDeviceMemory& memory) {
+void Renderer::createImage(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
+    VkImage& image, VmaAllocation& alloc) {
     VkImageCreateInfo info{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     info.imageType = VK_IMAGE_TYPE_2D;
     info.extent = { w, h, 1 };
     info.mipLevels = 1;
     info.arrayLayers = 1;
     info.format = format;
-    info.tiling = tiling;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     info.usage = usage;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateImage(device, &info, nullptr, &image) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create image");
-    }
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(device, image, &req);
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
-    VkMemoryAllocateInfo alloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, props);
-    if (vkAllocateMemory(device, &alloc, nullptr, &memory) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate image memory");
-    }
-    vkBindImageMemory(device, image, memory, 0);
+    if (vmaCreateImage(allocator, &info, &allocInfo, &image, &alloc, nullptr) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create image");
 }
 
 VkImageView Renderer::createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect) {
@@ -541,10 +549,8 @@ void Renderer::createDepthResources() {
     depthFormat = findDepthFormat();
     createImage(
         swapchainExtent.width, swapchainExtent.height,
-        depthFormat, VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        depthImage, depthImageMemory
+        depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        depthImage, depthAlloc
     );
     depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
 }
@@ -563,7 +569,7 @@ void Renderer::createRenderPass() {
 
     // Depth
     VkAttachmentDescription depthAttachment{};
-    depthAttachment.format = findDepthFormat();
+    depthAttachment.format = depthFormat;
     depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -635,7 +641,6 @@ VkShaderModule Renderer::createShaderModule(const std::vector<char>& code) {
 }
 
 void Renderer::createGraphicsPipeline() {
-    // Loads SPIR-V placed by CMake next to the exe
     const std::string base = "shaders/";
     auto vertCode = readFile(base + "triangle.vert.spv");
     auto fragCode = readFile(base + "triangle.frag.spv");
@@ -692,7 +697,7 @@ void Renderer::createGraphicsPipeline() {
     raster.rasterizerDiscardEnable = VK_FALSE;
     raster.polygonMode = VK_POLYGON_MODE_FILL;
     raster.cullMode = VK_CULL_MODE_BACK_BIT;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // proper CCW for our vertex order
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.depthBiasEnable = VK_FALSE;
     raster.lineWidth = 1.0f;
 
@@ -732,7 +737,6 @@ void Renderer::createGraphicsPipeline() {
     pipeInfo.pMultisampleState = &msaa;
     pipeInfo.pDepthStencilState = &depthStencil;
     pipeInfo.pColorBlendState = &colorBlend;
-    pipeInfo.pDynamicState = nullptr;
     pipeInfo.layout = pipelineLayout;
     pipeInfo.renderPass = renderPass;
     pipeInfo.subpass = 0;
@@ -821,7 +825,6 @@ void Renderer::createSyncObjects() {
     imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
     inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
 
-    // Per-image sync for present waits
     renderFinishedSemaphores.resize(swapchainImages.size());
     imagesInFlight.resize(swapchainImages.size(), VK_NULL_HANDLE);
 
@@ -829,7 +832,6 @@ void Renderer::createSyncObjects() {
     VkFenceCreateInfo fence{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    // Per-frame
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (vkCreateSemaphore(device, &sem, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(device, &fence, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
@@ -854,15 +856,20 @@ void Renderer::recreatePerImageSemaphores() {
 }
 
 void Renderer::destroySwapchainObjects() {
-    // descriptor stuff bound to swapchain count
+    if (!commandBuffers.empty()) {
+        vkFreeCommandBuffers(device, commandPool,
+            static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+        commandBuffers.clear();
+        
+    }
     if (descriptorPool) { vkDestroyDescriptorPool(device, descriptorPool, nullptr); descriptorPool = VK_NULL_HANDLE; }
+
     for (size_t i = 0; i < uniformBuffers.size(); ++i) {
-        if (uniformBuffers[i]) vkDestroyBuffer(device, uniformBuffers[i], nullptr);
-        if (uniformBuffersMemory[i]) vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        if (uniformBuffers[i])  vmaDestroyBuffer(allocator, uniformBuffers[i], uniformAllocs[i]);
     }
     uniformBuffers.clear();
-    uniformBuffersMemory.clear();
-    uniformBuffersMapped.clear();
+    uniformAllocs.clear();
+    uniformMapped.clear();
     descriptorSets.clear();
 
     if (graphicsPipeline) { vkDestroyPipeline(device, graphicsPipeline, nullptr); graphicsPipeline = VK_NULL_HANDLE; }
@@ -877,8 +884,7 @@ void Renderer::destroySwapchainObjects() {
     }
 
     if (depthImageView) { vkDestroyImageView(device, depthImageView, nullptr); depthImageView = VK_NULL_HANDLE; }
-    if (depthImage) { vkDestroyImage(device, depthImage, nullptr); depthImage = VK_NULL_HANDLE; }
-    if (depthImageMemory) { vkFreeMemory(device, depthImageMemory, nullptr); depthImageMemory = VK_NULL_HANDLE; }
+    if (depthImage) { vmaDestroyImage(allocator, depthImage, depthAlloc); depthImage = VK_NULL_HANDLE; depthAlloc = VK_NULL_HANDLE; }
 
     for (auto view : swapchainImageViews) vkDestroyImageView(device, view, nullptr);
     swapchainImageViews.clear();
@@ -901,11 +907,12 @@ void Renderer::recreateSwapchain() {
 
     destroySwapchainObjects();
 
+    // --- Rebuild in the correct order ---
     createSwapchain();
     createImageViews();
+    createDepthResources();      // <-- before render pass
     createRenderPass();
-    createDescriptorSetLayout(); // layout persists, but cheap if recreated consistently
-    createDepthResources();
+    // descriptorSetLayout is NOT recreated here
     createGraphicsPipeline();
     createFramebuffers();
 
@@ -913,31 +920,30 @@ void Renderer::recreateSwapchain() {
     createDescriptorPool();
     createDescriptorSets();
 
-    createCommandBuffers();     // depends on framebuffer count
+    createCommandBuffers();
     recreatePerImageSemaphores();
 }
 
-// ---------------- Buffer helpers ----------------
-void Renderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
-    VkBuffer& buffer, VkDeviceMemory& memory) {
-    VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    info.size = size;
-    info.usage = usage;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS)
+// ---------------- Buffer helpers (VMA) ----------------
+void Renderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+    VkBuffer& buffer, VmaAllocation& alloc, void** mapped) {
+    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size = size;
+    bi.usage = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    if (mapped) {
+        aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    }
+
+    VmaAllocationInfo out{};
+    if (vmaCreateBuffer(allocator, &bi, &aci, &buffer, &alloc, &out) != VK_SUCCESS)
         throw std::runtime_error("Failed to create buffer");
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(device, buffer, &req);
-
-    VkMemoryAllocateInfo alloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, props);
-    if (vkAllocateMemory(device, &alloc, nullptr, &memory) != VK_SUCCESS)
-        throw std::runtime_error("Failed to allocate buffer memory");
-
-    vkBindBufferMemory(device, buffer, memory, 0);
+    if (mapped) *mapped = out.pMappedData;
 }
 
 VkCommandBuffer Renderer::beginSingleTimeCommands() {
@@ -974,62 +980,61 @@ void Renderer::copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) {
 
 // ---------------- Resource creation ----------------
 void Renderer::createVertexBuffer() {
-    VkDeviceSize size = sizeof(Vertex) * gVertices.size();
+    const VkDeviceSize size = sizeof(Vertex) * gVertices.size();
 
-    VkBuffer staging;
-    VkDeviceMemory stagingMem;
-    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        staging, stagingMem);
+    // Staging (CPU-visible)
+    VkBuffer staging{};
+    VmaAllocation stagingAlloc{};
+    void* mapped = nullptr;
+    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging, stagingAlloc, &mapped);
 
-    void* data = nullptr;
-    vkMapMemory(device, stagingMem, 0, size, 0, &data);
-    std::memcpy(data, gVertices.data(), (size_t)size);
-    vkUnmapMemory(device, stagingMem);
+    // Write and FLUSH so non-coherent memory is visible
+    std::memcpy(mapped, gVertices.data(), static_cast<size_t>(size));
+    vmaFlushAllocation(allocator, stagingAlloc, 0, size);
 
+    // Device-local vertex buffer
     createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+        vertexBuffer, vertexAlloc);
 
+    // Copy and clean up
     copyBuffer(staging, vertexBuffer, size);
-
-    vkDestroyBuffer(device, staging, nullptr);
-    vkFreeMemory(device, stagingMem, nullptr);
+    vmaDestroyBuffer(allocator, staging, stagingAlloc);
 }
+
 
 void Renderer::createIndexBuffer() {
-    VkDeviceSize size = sizeof(uint16_t) * gIndices.size();
+    const VkDeviceSize size = sizeof(uint16_t) * gIndices.size();
 
-    VkBuffer staging;
-    VkDeviceMemory stagingMem;
-    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        staging, stagingMem);
+    // Staging (CPU-visible)
+    VkBuffer staging{};
+    VmaAllocation stagingAlloc{};
+    void* mapped = nullptr;
+    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging, stagingAlloc, &mapped);
 
-    void* data = nullptr;
-    vkMapMemory(device, stagingMem, 0, size, 0, &data);
-    std::memcpy(data, gIndices.data(), (size_t)size);
-    vkUnmapMemory(device, stagingMem);
+    // Write and FLUSH so non-coherent memory is visible
+    std::memcpy(mapped, gIndices.data(), static_cast<size_t>(size));
+    vmaFlushAllocation(allocator, stagingAlloc, 0, size);
 
+    // Device-local index buffer
     createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer, indexBufferMemory);
+        indexBuffer, indexAlloc);
 
+    // Copy and clean up
     copyBuffer(staging, indexBuffer, size);
-
-    vkDestroyBuffer(device, staging, nullptr);
-    vkFreeMemory(device, stagingMem, nullptr);
+    vmaDestroyBuffer(allocator, staging, stagingAlloc);
 }
 
+
 void Renderer::createUniformBuffers() {
-    VkDeviceSize size = sizeof(UniformBufferObject);
+    const VkDeviceSize size = sizeof(UniformBufferObject);
     uniformBuffers.resize(swapchainImages.size());
-    uniformBuffersMemory.resize(swapchainImages.size());
-    uniformBuffersMapped.resize(swapchainImages.size());
+    uniformAllocs.resize(swapchainImages.size());
+    uniformMapped.resize(swapchainImages.size());
 
     for (size_t i = 0; i < swapchainImages.size(); ++i) {
-        createBuffer(size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            uniformBuffers[i], uniformBuffersMemory[i]);
-        vkMapMemory(device, uniformBuffersMemory[i], 0, size, 0, &uniformBuffersMapped[i]);
+        void* mapped = nullptr;
+        createBuffer(size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, uniformBuffers[i], uniformAllocs[i], &mapped);
+        uniformMapped[i] = mapped;
     }
 }
 
@@ -1042,15 +1047,18 @@ void Renderer::updateUniformBuffer(uint32_t imageIndex) {
         glm::vec3(0.f, 1.f, 0.f));
     float aspect = swapchainExtent.width / static_cast<float>(std::max(1u, swapchainExtent.height));
     glm::mat4 proj = glm::perspective(glm::radians(60.f), aspect, 0.01f, 10.f);
-    // GLM with ZERO_TO_ONE flips Y for Vulkan; also make triangle visible
     proj[1][1] *= -1.f;
 
     glm::mat4 mvp = proj * view * model;
 
     UniformBufferObject u{};
     std::memcpy(u.mvp, &mvp[0][0], sizeof(u.mvp));
-    std::memcpy(uniformBuffersMapped[imageIndex], &u, sizeof(u));
+
+    // Persistently mapped UBO: write then FLUSH
+    std::memcpy(uniformMapped[imageIndex], &u, sizeof(u));
+    vmaFlushAllocation(allocator, uniformAllocs[imageIndex], 0, sizeof(u));
 }
+
 
 void Renderer::createDescriptorPool() {
     VkDescriptorPoolSize pool{};
