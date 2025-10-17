@@ -6,6 +6,9 @@
 #include <chrono>
 #include <array>
 #include <stdexcept>
+#include <string>
+
+#include "PipelineCache.hpp"
 
 struct GLFWwindow;
 
@@ -74,6 +77,8 @@ private:
     uint32_t currentFrame = 0;
 
     bool framebufferResized = false;
+
+    PipelineCacheManager pipelineCache;
 
     // Time
     std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();

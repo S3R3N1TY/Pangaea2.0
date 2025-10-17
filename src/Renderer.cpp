@@ -1,4 +1,5 @@
 #include "Renderer.hpp"
+#include "PipelineBuilder.hpp"
 
 #include <GLFW/glfw3.h>
 #include <iostream>
@@ -100,6 +101,7 @@ void Renderer::init(GLFWwindow* window) {
 
     // Reusable staging uploader (1 MB initial)
     uploader.init(allocator, device, graphicsQueue, commandPool, 1ull << 20);
+    pipelineCache.init(physicalDevice, device, "cache");
 
 
     // --- Swapchain-dependent setup (correct order so depthFormat is known) ---
@@ -139,6 +141,7 @@ void Renderer::cleanup() {
     }
 
     uploader.destroy();
+    pipelineCache.destroy();
 
     if (commandPool) {
         vkDestroyCommandPool(device, commandPool, nullptr);
@@ -641,19 +644,7 @@ void Renderer::createGraphicsPipeline() {
     VkShaderModule vertModule = createShaderModule(vertCode);
     VkShaderModule fragModule = createShaderModule(fragCode);
 
-    VkPipelineShaderStageCreateInfo vertStage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    vertStage.module = vertModule;
-    vertStage.pName = "main";
-
-    VkPipelineShaderStageCreateInfo fragStage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    fragStage.module = fragModule;
-    fragStage.pName = "main";
-
-    VkPipelineShaderStageCreateInfo stages[] = { vertStage, fragStage };
-
-    // Vertex input
+    // Vertex input layout
     VkVertexInputBindingDescription bind{};
     bind.binding = 0;
     bind.stride = sizeof(Vertex);
@@ -663,28 +654,7 @@ void Renderer::createGraphicsPipeline() {
     attrs[0].location = 0; attrs[0].binding = 0; attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = offsetof(Vertex, pos);
     attrs[1].location = 1; attrs[1].binding = 0; attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = offsetof(Vertex, color);
 
-    VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &bind;
-    vertexInput.vertexAttributeDescriptionCount = 2;
-    vertexInput.pVertexAttributeDescriptions = attrs;
-
-    VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    inputAssembly.primitiveRestartEnable = VK_FALSE;
-
-    VkViewport viewport{};
-    viewport.x = 0.0f; viewport.y = 0.0f;
-    viewport.width = static_cast<float>(swapchainExtent.width);
-    viewport.height = static_cast<float>(swapchainExtent.height);
-    viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{ {0,0}, swapchainExtent };
-
-    VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    viewportState.viewportCount = 1; viewportState.pViewports = &viewport;
-    viewportState.scissorCount = 1;  viewportState.pScissors = &scissor;
-
+    // Fixed states
     VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     raster.depthClampEnable = VK_FALSE;
     raster.rasterizerDiscardEnable = VK_FALSE;
@@ -704,19 +674,17 @@ void Renderer::createGraphicsPipeline() {
     depthStencil.depthBoundsTestEnable = VK_FALSE;
     depthStencil.stencilTestEnable = VK_FALSE;
 
-    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+    VkPipelineColorBlendAttachmentState colorAttachment{};
+    colorAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    colorAttachment.blendEnable = VK_FALSE;
 
-    VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    colorBlend.attachmentCount = 1;
-    colorBlend.pAttachments = &colorBlendAttachment;
-
+    // Pipeline layout with push constants
     VkPushConstantRange pc{};
     pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pc.offset = 0;
-    pc.size = sizeof(glm::mat4); // 64 bytes
+    pc.size = sizeof(glm::mat4);
 
     VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     layoutInfo.setLayoutCount = 1;
@@ -727,35 +695,28 @@ void Renderer::createGraphicsPipeline() {
     if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS)
         throw std::runtime_error("Failed to create pipeline layout");
 
-    // Dynamic rendering attachment formats
-    VkPipelineRenderingCreateInfo rendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &swapchainImageFormat;
-    rendering.depthAttachmentFormat = depthFormat;
-    rendering.stencilAttachmentFormat = VK_FORMAT_UNDEFINED; // not using stencil
-
-    VkGraphicsPipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pipeInfo.pNext = &rendering; // tie formats to pipeline
-    pipeInfo.flags = VK_PIPELINE_CREATE_RENDERING_BIT;
-    pipeInfo.stageCount = 2;
-    pipeInfo.pStages = stages;
-    pipeInfo.pVertexInputState = &vertexInput;
-    pipeInfo.pInputAssemblyState = &inputAssembly;
-    pipeInfo.pViewportState = &viewportState;
-    pipeInfo.pRasterizationState = &raster;
-    pipeInfo.pMultisampleState = &msaa;
-    pipeInfo.pDepthStencilState = &depthStencil;
-    pipeInfo.pColorBlendState = &colorBlend;
-    pipeInfo.layout = pipelineLayout;
-    pipeInfo.renderPass = VK_NULL_HANDLE; // no render pass
-    pipeInfo.subpass = 0;              // ignored in dynamic rendering
-
-    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &graphicsPipeline) != VK_SUCCESS)
-        throw std::runtime_error("Failed to create graphics pipeline");
+    // Build via PipelineBuilder
+    PipelineBuilder pb;
+    pb.clearStages()
+        .addStage(VK_SHADER_STAGE_VERTEX_BIT, vertModule, "main")
+        .addStage(VK_SHADER_STAGE_FRAGMENT_BIT, fragModule, "main")
+        .setVertexInput(&bind, 1, attrs, 2)
+        .setInputAssembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE)
+        .setViewport(0.f, 0.f, (float)swapchainExtent.width, (float)swapchainExtent.height)
+        .setScissor(0, 0, swapchainExtent.width, swapchainExtent.height)
+        .setRasterization(raster)
+        .setMultisample(msaa)
+        .setDepthStencil(depthStencil)
+        .setColorBlendAttachments({ colorAttachment })
+        .setLayout(pipelineLayout)
+        .setRenderingFormats({ swapchainImageFormat }, depthFormat)
+        .setPipelineCache(pipelineCache.get());  // <-- wire it
+    graphicsPipeline = pb.build(device);
 
     vkDestroyShaderModule(device, fragModule, nullptr);
     vkDestroyShaderModule(device, vertModule, nullptr);
 }
+
 
 void Renderer::createCommandPool() {
     auto indices = findQueueFamilies(physicalDevice);
