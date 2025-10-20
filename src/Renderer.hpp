@@ -21,7 +21,7 @@ public:
     void setFramebufferResized(bool v) { framebufferResized = v; }
 
 private:
-    // Core
+    // ---------------- Core ----------------
     VkInstance instance{};
     VkDebugUtilsMessengerEXT debugMessenger{};
     VkSurfaceKHR surface{};
@@ -32,31 +32,31 @@ private:
     VkQueue presentQueue{};
     GLFWwindow* windowHandle = nullptr;
 
-    // Swapchain
+    // ---------------- Swapchain ----------------
     VkSwapchainKHR swapchain{};
-    VkFormat swapchainImageFormat{};
-    VkExtent2D swapchainExtent{};
-    std::vector<VkImage> swapchainImages;
+    VkFormat       swapchainImageFormat{};
+    VkExtent2D     swapchainExtent{};
+    std::vector<VkImage>     swapchainImages;
     std::vector<VkImageView> swapchainImageViews;
 
-    // Depth
-    VkImage        depthImage{};
-    VmaAllocation  depthAlloc{};
-    VkImageView    depthImageView{};
-    VkFormat       depthFormat{};
+    // ---------------- Depth ----------------
+    VkImage       depthImage{};
+    VmaAllocation depthAlloc{};
+    VkImageView   depthImageView{};
+    VkFormat      depthFormat{};
 
-    // Render pass, pipeline & framebuffers
+    // ---------------- Pipeline ----------------
     VkDescriptorSetLayout descriptorSetLayout{};
-    VkPipelineLayout pipelineLayout{};
-    VkPipeline graphicsPipeline{};
+    VkPipelineLayout      pipelineLayout{};
+    VkPipeline            graphicsPipeline{};
 
-    // Buffers: vertex/index
-    VkBuffer       vertexBuffer{};
-    VmaAllocation  vertexAlloc{};
-    VkBuffer       indexBuffer{};
-    VmaAllocation  indexAlloc{};
+    // ---------------- Geometry buffers ----------------
+    VkBuffer      vertexBuffer{};
+    VmaAllocation vertexAlloc{};
+    VkBuffer      indexBuffer{};
+    VmaAllocation indexAlloc{};
 
-    // Uniforms: per swapchain image
+    // ---------------- Uniforms (per swapchain image) ----------------
     struct UniformBufferObject { float vp[16]; };
     std::vector<VkBuffer>      uniformBuffers;
     std::vector<VmaAllocation> uniformAllocs;
@@ -64,11 +64,11 @@ private:
 
     std::vector<VkDescriptorSet> descriptorSets;
 
-    // Commands
+    // ---------------- Commands ----------------
     VkCommandPool commandPool{};
     std::vector<VkCommandBuffer> commandBuffers;
 
-    // Sync
+    // ---------------- Sync ----------------
     static constexpr int MAX_FRAMES_IN_FLIGHT = 2;
     std::vector<VkSemaphore> imageAvailableSemaphores;  // per-frame
     std::vector<VkSemaphore> renderFinishedSemaphores;  // per-swapchain-image
@@ -80,11 +80,11 @@ private:
 
     PipelineCacheManager pipelineCache;
 
-    // Time
+    // ---------------- Time ----------------
     std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
 
 private:
-    // Setup
+    // ==================== Setup ====================
     void createInstance();
     void setupDebugMessenger();
     void populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& createInfo);
@@ -93,49 +93,50 @@ private:
     void createLogicalDevice();
     void createAllocator(); // VMA
 
-    // Swapchain pipeline
+    // ==================== Swapchain pipeline ====================
     void createSwapchain();
     void createImageViews();
-    void createDescriptorSetLayout();
+    void createDescriptorSetLayout();   // swapchain-independent
     void createDepthResources();
-    void createGraphicsPipeline();
+    void createGraphicsPipeline();      // survives resizes (dynamic viewport/scissor)
 
-    // Resources
+    // ==================== Resources ====================
     void createVertexBuffer();
     void createIndexBuffer();
     void createUniformBuffers();
     void updateUniformBuffer(uint32_t imageIndex);
     void createDescriptorSets();
 
-    // Commands
+    // ==================== Commands ====================
     void createCommandPool();
     void createCommandBuffers();
 
-    // Sync
+    // ==================== Sync ====================
     void createSyncObjects();
     void recreatePerImageSemaphores();
 
-    // Helpers
+    // ==================== Helpers ====================
     struct QueueFamilyIndices {
         std::optional<uint32_t> graphicsFamily;
         std::optional<uint32_t> presentFamily;
-        bool isComplete() const { return graphicsFamily.has_value() && presentFamily.has_value(); }
+        [[nodiscard]] bool isComplete() const { return graphicsFamily.has_value() && presentFamily.has_value(); }
     };
     struct SwapSupportDetails {
         VkSurfaceCapabilitiesKHR capabilities{};
         std::vector<VkSurfaceFormatKHR> formats;
-        std::vector<VkPresentModeKHR> presentModes;
+        std::vector<VkPresentModeKHR>   presentModes;
     };
-    QueueFamilyIndices   findQueueFamilies(VkPhysicalDevice dev);
-    bool                 isDeviceSuitable(VkPhysicalDevice dev);
-    SwapSupportDetails   querySwapSupport(VkPhysicalDevice dev);
-    VkSurfaceFormatKHR   chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>&);
-    VkPresentModeKHR     chooseSwapPresentMode(const std::vector<VkPresentModeKHR>&);
-    VkExtent2D           chooseSwapExtent(const VkSurfaceCapabilitiesKHR&);
-    void                 recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
-    VkShaderModule       createShaderModule(const std::vector<char>& code);
 
-    // ---------------- Staging uploader ----------------
+    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice dev);
+    [[nodiscard]] bool isDeviceSuitable(VkPhysicalDevice dev);
+    SwapSupportDetails querySwapSupport(VkPhysicalDevice dev);
+    VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>&);
+    VkPresentModeKHR   chooseSwapPresentMode(const std::vector<VkPresentModeKHR>&);
+    VkExtent2D         chooseSwapExtent(const VkSurfaceCapabilitiesKHR&);
+    void               recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
+    VkShaderModule     createShaderModule(const std::vector<char>& code);
+
+    // ==================== Staging uploader ====================
     struct StagingUploader {
         // External deps
         VmaAllocator allocator = VK_NULL_HANDLE;
@@ -144,10 +145,10 @@ private:
         VkCommandPool cmdPool = VK_NULL_HANDLE;
 
         // Reusable staging buffer
-        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VkBuffer      stagingBuffer = VK_NULL_HANDLE;
         VmaAllocation stagingAlloc = VK_NULL_HANDLE;
         void* mapped = nullptr;
-        VkDeviceSize capacity = 0;
+        VkDeviceSize  capacity = 0;
 
         // Per-upload fence
         VkFence copyFence = VK_NULL_HANDLE;
@@ -155,10 +156,10 @@ private:
         void init(VmaAllocator alloc, VkDevice dev, VkQueue q, VkCommandPool pool, VkDeviceSize initialCapacity);
         void destroy();
 
-        // Ensures capacity >= requiredBytes, reallocating if needed which keeps mapping persistent
+        // Ensure capacity >= requiredBytes; reallocates if needed while keeping mapping persistent.
         void ensureCapacity(VkDeviceSize requiredBytes);
 
-        // Blocking upload: memcpy to staging, flush, record copy, submit, wait on fence
+        // Blocking upload: memcpy to staging, flush, record copy, submit, wait on fence.
         void upload(const void* src, VkDeviceSize sizeBytes, VkBuffer dst, VkDeviceSize dstOffset);
 
     private:
@@ -172,11 +173,10 @@ private:
     void createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
         VkBuffer& buffer, VmaAllocation& alloc);
 
-    // ---------------- Descriptor arena (auto-growing pools) ----------------
+    // ==================== Descriptor arena (auto-growing pools) ====================
     struct DescriptorArena {
         VkDevice device = VK_NULL_HANDLE;
         uint32_t maxSetsPerPool = 256; // grow in chunks
-
         std::vector<VkDescriptorPool> pools;
 
         void init(VkDevice dev) { device = dev; }
@@ -186,7 +186,6 @@ private:
             device = VK_NULL_HANDLE;
         }
         // Reset all pools so their sets become invalid, ready for re-allocation.
-        // Use this on swapchain rebuild, or at frame-begin if you switch to per-frame sets.
         void reset() {
             for (auto p : pools) if (p) vkResetDescriptorPool(device, p, 0);
         }
@@ -213,13 +212,12 @@ private:
         }
 
     private:
-        // Tiny helper so we can write VK_CHECK above without littering the class
         static void VK_CHECK(VkResult res) {
             if (res != VK_SUCCESS) throw std::runtime_error("DescriptorArena: VkResult != VK_SUCCESS");
         }
 
         VkDescriptorPool createPool() {
-            // Generous defaults so you don’t babysit counts. Tune later if needed.
+            // Generous defaults; tune later if needed.
             std::array<VkDescriptorPoolSize, 5> sizes{ {
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         maxSetsPerPool },
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxSetsPerPool },
@@ -229,7 +227,7 @@ private:
             } };
 
             VkDescriptorPoolCreateInfo info{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; // nice to have
+            info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
             info.maxSets = maxSetsPerPool * 2; // headroom
             info.poolSizeCount = static_cast<uint32_t>(sizes.size());
             info.pPoolSizes = sizes.data();
@@ -244,12 +242,11 @@ private:
 
     DescriptorArena descriptorArena;
 
-
-    // Images & buffers
+    // ==================== Images & buffers ====================
     VkFormat findDepthFormat();
-    bool hasStencilComponent(VkFormat format);
+    [[nodiscard]] bool hasStencilComponent(VkFormat format);
 
-    // VMA versions
+    // VMA wrappers
     void createImage(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
         VkImage& image, VmaAllocation& alloc);
     VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect);
@@ -257,11 +254,11 @@ private:
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
         VkBuffer& buffer, VmaAllocation& alloc, void** mapped = nullptr);
 
-    void copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size);
+    void           copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size);
     VkCommandBuffer beginSingleTimeCommands();
-    void endSingleTimeCommands(VkCommandBuffer cmd);
+    void            endSingleTimeCommands(VkCommandBuffer cmd);
 
-    // Resize handling
+    // ==================== Resize handling ====================
     void recreateSwapchain();
     void destroySwapchainObjects();
 };

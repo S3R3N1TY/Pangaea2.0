@@ -18,36 +18,36 @@
 
 // --- Vulkan 1.3 dynamic rendering compatibility shims ---
 // Works with 1.3 core, KHR-only headers, or prehistoric headers.
-
 #ifndef VK_PIPELINE_CREATE_RENDERING_BIT
-#ifdef VK_PIPELINE_CREATE_RENDERING_BIT_KHR
-#define VK_PIPELINE_CREATE_RENDERING_BIT VK_PIPELINE_CREATE_RENDERING_BIT_KHR
-#else
-  // Old headers have neither. It's fine to set this to 0
-  // as long as VkPipelineRenderingCreateInfo is chained via pNext.
-#define VK_PIPELINE_CREATE_RENDERING_BIT 0
-#endif
+# ifdef VK_PIPELINE_CREATE_RENDERING_BIT_KHR
+#  define VK_PIPELINE_CREATE_RENDERING_BIT VK_PIPELINE_CREATE_RENDERING_BIT_KHR
+# else
+   // Old headers have neither. It's fine to set this to 0
+   // as long as VkPipelineRenderingCreateInfo is chained via pNext.
+#  define VK_PIPELINE_CREATE_RENDERING_BIT 0
+# endif
 #endif
 
 #ifndef VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
-#ifdef VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL_KHR
-#define VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL_KHR
-#else
-#define VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-#endif
+# ifdef VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL_KHR
+#  define VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL_KHR
+# else
+#  define VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+# endif
 #endif
 
-// --------- file loader ----------
+// --------- file loader (safer) ----------
 static std::vector<char> readFile(const std::string& path) {
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file) throw std::runtime_error("Failed to open file: " + path);
-    const size_t size = static_cast<size_t>(file.tellg());
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("Shader open failed: " + path);
+    const auto size = static_cast<size_t>(f.tellg());
+    if (size == 0) throw std::runtime_error("Shader empty or unreadable: " + path);
     std::vector<char> data(size);
-    file.seekg(0);
-    file.read(data.data(), size);
+    f.seekg(0);
+    f.read(data.data(), static_cast<std::streamsize>(size));
+    if (!f) throw std::runtime_error("Shader short read: " + path);
     return data;
 }
-
 
 // ---------------- Debug callback ----------------
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
@@ -76,6 +76,11 @@ static bool hasLayer(const char* name) {
     return false;
 }
 
+// Device-level debug utils function pointers for naming/markers
+static PFN_vkSetDebugUtilsObjectNameEXT pSetName = nullptr;
+static PFN_vkCmdBeginDebugUtilsLabelEXT pBeginLabel = nullptr;
+static PFN_vkCmdEndDebugUtilsLabelEXT   pEndLabel = nullptr;
+
 // ---------------- Vertex data ----------------
 struct Vertex {
     glm::vec3 pos;
@@ -99,15 +104,14 @@ void Renderer::init(GLFWwindow* window) {
     createAllocator();       // VMA
     createCommandPool();     // needed for staging and one-shot cmds
 
-    // Reusable staging uploader (1 MB initial)
+    // Reusable staging uploader
     uploader.init(allocator, device, graphicsQueue, commandPool, 1ull << 20);
     pipelineCache.init(physicalDevice, device, "cache");
-
 
     // --- Swapchain-dependent setup (correct order so depthFormat is known) ---
     createSwapchain();
     createImageViews();
-    createDepthResources();      // <-- moved before render pass
+    createDepthResources();      // depth before pipeline so formats are known
     createDescriptorSetLayout(); // created once for lifetime of renderer
     createGraphicsPipeline();
 
@@ -124,7 +128,6 @@ void Renderer::init(GLFWwindow* window) {
     createSyncObjects();
 }
 
-
 void Renderer::cleanup() {
     vkDeviceWaitIdle(device);
 
@@ -133,6 +136,17 @@ void Renderer::cleanup() {
     if (vertexBuffer) { vmaDestroyBuffer(allocator, vertexBuffer, vertexAlloc); vertexBuffer = VK_NULL_HANDLE; }
 
     destroySwapchainObjects();
+
+    // Kill pipeline objects kept across resizes
+    if (graphicsPipeline) {
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        graphicsPipeline = VK_NULL_HANDLE;
+    }
+    if (pipelineLayout) {
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        pipelineLayout = VK_NULL_HANDLE;
+    }
+
     descriptorArena.destroy();
 
     if (descriptorSetLayout) {
@@ -290,7 +304,6 @@ void Renderer::createInstance() {
         throw std::runtime_error("Failed to create Vulkan instance");
 }
 
-
 void Renderer::populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& createInfo) {
     createInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
     createInfo.messageSeverity =
@@ -403,16 +416,26 @@ void Renderer::createLogicalDevice() {
         queueInfos.push_back(q);
     }
 
-    VkPhysicalDeviceFeatures features{}; // leave default for now
+    VkPhysicalDeviceFeatures features{}; // default
 
     const char* deviceExtensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
 
-    // Request dynamic rendering (core in 1.3)
-    VkPhysicalDeviceDynamicRenderingFeatures dyn{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES };
+    // --- Features chain: Dynamic Rendering + Synchronization2 (core in 1.3) ---
+    VkPhysicalDeviceDynamicRenderingFeatures dyn{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES
+    };
     dyn.dynamicRendering = VK_TRUE;
 
+    VkPhysicalDeviceSynchronization2Features sync2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES
+    };
+    sync2.synchronization2 = VK_TRUE;
+
+    // chain head -> next
+    dyn.pNext = &sync2;
+
     VkDeviceCreateInfo createInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    createInfo.pNext = &dyn; // chain features
+    createInfo.pNext = &dyn;  // head of the chain
     createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
     createInfo.pQueueCreateInfos = queueInfos.data();
     createInfo.pEnabledFeatures = &features;
@@ -426,8 +449,12 @@ void Renderer::createLogicalDevice() {
 
     vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
-}
 
+    // Load device-level debug utils (Safe if extension missing)
+    pSetName = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(device, "vkSetDebugUtilsObjectNameEXT");
+    pBeginLabel = (PFN_vkCmdBeginDebugUtilsLabelEXT)vkGetDeviceProcAddr(device, "vkCmdBeginDebugUtilsLabelEXT");
+    pEndLabel = (PFN_vkCmdEndDebugUtilsLabelEXT)vkGetDeviceProcAddr(device, "vkCmdEndDebugUtilsLabelEXT");
+}
 
 void Renderer::createAllocator() {
     VmaAllocatorCreateInfo info{};
@@ -440,8 +467,11 @@ void Renderer::createAllocator() {
         throw std::runtime_error("Failed to create VMA allocator");
 }
 
+
 VkSurfaceFormatKHR Renderer::chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) {
-    // Perfect match: sRGB + nonlinear color space
+    if (formats.empty()) throw std::runtime_error("No surface formats reported by the device");
+
+    // Prefer sRGB formats for correct presentation gamma
     for (const auto& f : formats) {
         if (f.format == VK_FORMAT_B8G8R8A8_SRGB && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
             return f;
@@ -450,10 +480,9 @@ VkSurfaceFormatKHR Renderer::chooseSwapSurfaceFormat(const std::vector<VkSurface
         if (f.format == VK_FORMAT_R8G8B8A8_SRGB && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
             return f;
     }
-    // Fallback: takes the first available.
+    // Fallback: first available format
     return formats[0];
 }
-
 
 VkPresentModeKHR Renderer::chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& modes) {
     for (auto m : modes) if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
@@ -490,7 +519,7 @@ void Renderer::createSwapchain() {
     createInfo.imageColorSpace = surfaceFormat.colorSpace;
     createInfo.imageExtent = extent;
     createInfo.imageArrayLayers = 1;
-    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; // add TRANSFER_* later if you need screenshots/post
 
     auto indices = findQueueFamilies(physicalDevice);
     uint32_t queueFamilyIndices[] = { indices.graphicsFamily.value(), indices.presentFamily.value() };
@@ -513,6 +542,15 @@ void Renderer::createSwapchain() {
     if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapchain) != VK_SUCCESS)
         throw std::runtime_error("Failed to create swapchain");
 
+    // Name the swapchain for sanity in RenderDoc
+    if (pSetName) {
+        VkDebugUtilsObjectNameInfoEXT n{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        n.objectType = VK_OBJECT_TYPE_SWAPCHAIN_KHR;
+        n.objectHandle = (uint64_t)swapchain;
+        n.pObjectName = "Swapchain";
+        pSetName(device, &n);
+    }
+
     vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr);
     swapchainImages.resize(imageCount);
     vkGetSwapchainImagesKHR(device, swapchain, &imageCount, swapchainImages.data());
@@ -527,8 +565,10 @@ void Renderer::createImageViews() {
         info.image = swapchainImages[i];
         info.viewType = VK_IMAGE_VIEW_TYPE_2D;
         info.format = swapchainImageFormat;
-        info.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                            VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+        info.components = {
+            VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY
+        };
         info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         info.subresourceRange.baseMipLevel = 0;
         info.subresourceRange.levelCount = 1;
@@ -537,10 +577,22 @@ void Renderer::createImageViews() {
 
         if (vkCreateImageView(device, &info, nullptr, &swapchainImageViews[i]) != VK_SUCCESS)
             throw std::runtime_error("Failed to create image view");
+
+        // Name the image view
+        if (pSetName) {
+            VkDebugUtilsObjectNameInfoEXT n{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+            n.objectType = VK_OBJECT_TYPE_IMAGE_VIEW;
+            n.objectHandle = (uint64_t)swapchainImageViews[i];
+            // Tiny, readable labels: "SwapView[0]", "SwapView[1]"...
+            char label[32]; std::snprintf(label, sizeof(label), "SwapView[%zu]", i);
+            n.pObjectName = label;
+            pSetName(device, &n);
+        }
     }
 }
 
 VkFormat Renderer::findDepthFormat() {
+    // Prefer stencil-less unless need stencil later?
     const VkFormat candidates[] = {
         VK_FORMAT_D32_SFLOAT,
         VK_FORMAT_D32_SFLOAT_S8_UINT,
@@ -549,9 +601,8 @@ VkFormat Renderer::findDepthFormat() {
     for (VkFormat f : candidates) {
         VkFormatProperties props{};
         vkGetPhysicalDeviceFormatProperties(physicalDevice, f, &props);
-        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
             return f;
-        }
     }
     throw std::runtime_error("Failed to find supported depth format");
 }
@@ -593,9 +644,8 @@ VkImageView Renderer::createImageView(VkImage image, VkFormat format, VkImageAsp
     view.subresourceRange.layerCount = 1;
 
     VkImageView imageView{};
-    if (vkCreateImageView(device, &view, nullptr, &imageView) != VK_SUCCESS) {
+    if (vkCreateImageView(device, &view, nullptr, &imageView) != VK_SUCCESS)
         throw std::runtime_error("Failed to create image view");
-    }
     return imageView;
 }
 
@@ -603,10 +653,20 @@ void Renderer::createDepthResources() {
     depthFormat = findDepthFormat();
     createImage(
         swapchainExtent.width, swapchainExtent.height,
-        depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT /* | VK_IMAGE_USAGE_SAMPLED_BIT */,
         depthImage, depthAlloc
     );
     depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // Debug names
+    if (pSetName) {
+        VkDebugUtilsObjectNameInfoEXT n{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        n.objectType = VK_OBJECT_TYPE_IMAGE; n.objectHandle = (uint64_t)depthImage; n.pObjectName = "DepthImage";
+        pSetName(device, &n);
+        n = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        n.objectType = VK_OBJECT_TYPE_IMAGE_VIEW; n.objectHandle = (uint64_t)depthImageView; n.pObjectName = "DepthView";
+        pSetName(device, &n);
+    }
 }
 
 void Renderer::createDescriptorSetLayout() {
@@ -634,7 +694,6 @@ VkShaderModule Renderer::createShaderModule(const std::vector<char>& code) {
         throw std::runtime_error("Failed to create shader module");
     return module;
 }
-
 
 void Renderer::createGraphicsPipeline() {
     const std::string base = "shaders/";
@@ -702,21 +761,32 @@ void Renderer::createGraphicsPipeline() {
         .addStage(VK_SHADER_STAGE_FRAGMENT_BIT, fragModule, "main")
         .setVertexInput(&bind, 1, attrs, 2)
         .setInputAssembly(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE)
-        .setViewport(0.f, 0.f, (float)swapchainExtent.width, (float)swapchainExtent.height)
-        .setScissor(0, 0, swapchainExtent.width, swapchainExtent.height)
+        .setViewport(0.f, 0.f, (float)swapchainExtent.width, (float)swapchainExtent.height)  // ignored if dynamic
+        .setScissor(0, 0, swapchainExtent.width, swapchainExtent.height)                      // ignored if dynamic
         .setRasterization(raster)
         .setMultisample(msaa)
         .setDepthStencil(depthStencil)
         .setColorBlendAttachments({ colorAttachment })
         .setLayout(pipelineLayout)
         .setRenderingFormats({ swapchainImageFormat }, depthFormat)
-        .setPipelineCache(pipelineCache.get());  // <-- wire it
+        .setPipelineCache(pipelineCache.get())
+        .setDynamicStates({ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR });
+
     graphicsPipeline = pb.build(device);
+
+    // Name pipeline & layout
+    if (pSetName) {
+        VkDebugUtilsObjectNameInfoEXT n{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        n.objectType = VK_OBJECT_TYPE_PIPELINE; n.objectHandle = (uint64_t)graphicsPipeline; n.pObjectName = "TrianglePipeline";
+        pSetName(device, &n);
+        n = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        n.objectType = VK_OBJECT_TYPE_PIPELINE_LAYOUT; n.objectHandle = (uint64_t)pipelineLayout; n.pObjectName = "MainLayout";
+        pSetName(device, &n);
+    }
 
     vkDestroyShaderModule(device, fragModule, nullptr);
     vkDestroyShaderModule(device, vertModule, nullptr);
 }
-
 
 void Renderer::createCommandPool() {
     auto indices = findQueueFamilies(physicalDevice);
@@ -737,56 +807,55 @@ void Renderer::createCommandBuffers() {
         throw std::runtime_error("Failed to allocate command buffers");
 }
 
+// ==================== Renderer::recordCommandBuffer (Sync2 barriers + dynamic viewport/scissor) ====================
 void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS)
         throw std::runtime_error("Failed to begin command buffer");
 
-    // --- Layout transitions (classic barrier for compatibility) ---
-    // Swapchain image: UNDEFINED or PRESENT_SRC -> COLOR_ATTACHMENT_OPTIMAL
-    VkImageMemoryBarrier colorBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    colorBarrier.srcAccessMask = 0;
-    colorBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    colorBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;          // ok each frame with discard/clear
-    colorBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    colorBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    colorBarrier.image = swapchainImages[imageIndex];
-    colorBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    colorBarrier.subresourceRange.baseMipLevel = 0;
-    colorBarrier.subresourceRange.levelCount = 1;
-    colorBarrier.subresourceRange.baseArrayLayer = 0;
-    colorBarrier.subresourceRange.layerCount = 1;
+    // --- Sync2: begin-of-pass image layout transitions ---
+    VkImageMemoryBarrier2 colorBarrier2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    colorBarrier2.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    colorBarrier2.srcAccessMask = 0;
+    colorBarrier2.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    colorBarrier2.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    colorBarrier2.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;              // discard on clear
+    colorBarrier2.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorBarrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    colorBarrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    colorBarrier2.image = swapchainImages[imageIndex];
+    colorBarrier2.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    colorBarrier2.subresourceRange.baseMipLevel = 0;
+    colorBarrier2.subresourceRange.levelCount = 1;
+    colorBarrier2.subresourceRange.baseArrayLayer = 0;
+    colorBarrier2.subresourceRange.layerCount = 1;
 
-    // Depth image: UNDEFINED or whatever -> DEPTH_ATTACHMENT_OPTIMAL
-    VkImageMemoryBarrier depthBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    depthBarrier.srcAccessMask = 0;
-    depthBarrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    depthBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; // 1.3 name, maps to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-    depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    depthBarrier.image = depthImage;
-    depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    depthBarrier.subresourceRange.baseMipLevel = 0;
-    depthBarrier.subresourceRange.levelCount = 1;
-    depthBarrier.subresourceRange.baseArrayLayer = 0;
-    depthBarrier.subresourceRange.layerCount = 1;
+    VkImageMemoryBarrier2 depthBarrier2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    depthBarrier2.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    depthBarrier2.srcAccessMask = 0;
+    depthBarrier2.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+    depthBarrier2.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depthBarrier2.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthBarrier2.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; // core 1.3 name
+    depthBarrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthBarrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthBarrier2.image = depthImage;
+    depthBarrier2.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthBarrier2.subresourceRange.baseMipLevel = 0;
+    depthBarrier2.subresourceRange.levelCount = 1;
+    depthBarrier2.subresourceRange.baseArrayLayer = 0;
+    depthBarrier2.subresourceRange.layerCount = 1;
 
-    std::array<VkImageMemoryBarrier, 2> barriers = { colorBarrier, depthBarrier };
-    vkCmdPipelineBarrier(
-        cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        0,
-        0, nullptr,
-        0, nullptr,
-        static_cast<uint32_t>(barriers.size()), barriers.data()
-    );
+    std::array<VkImageMemoryBarrier2, 2> imgBarriers{ colorBarrier2, depthBarrier2 };
+    VkDependencyInfo depBegin{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    depBegin.imageMemoryBarrierCount = static_cast<uint32_t>(imgBarriers.size());
+    depBegin.pImageMemoryBarriers = imgBarriers.data();
+    // no memory/buffer barriers in this batch
+    vkCmdPipelineBarrier2(cmd, &depBegin);
 
     // --- Dynamic rendering begin ---
-    VkClearValue clearColor{};     clearColor.color = { { 0.07f, 0.17f, 0.33f, 1.0f } };
-    VkClearValue clearDepth{};     clearDepth.depthStencil = { 1.0f, 0 };
+    VkClearValue clearColor{}; clearColor.color = { { 0.00f, 0.00f, 0.00f, 1.0f } };
+    VkClearValue clearDepth{}; clearDepth.depthStencil = { 1.0f, 0 };
 
     VkRenderingAttachmentInfo colorAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     colorAtt.imageView = swapchainImageViews[imageIndex];
@@ -797,7 +866,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
 
     VkRenderingAttachmentInfo depthAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     depthAtt.imageView = depthImageView;
-    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; // 1.3 name
+    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAtt.clearValue = clearDepth;
@@ -809,54 +878,62 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &colorAtt;
     rendering.pDepthAttachment = &depthAtt;
-    rendering.pStencilAttachment = nullptr;
 
     vkCmdBeginRendering(cmd, &rendering);
 
-    // Pipeline + descriptors + draws
+    // --- Pipeline + dynamic viewport/scissor ---
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
-    // Bind geometry
+    VkViewport vp{};
+    vp.x = 0.f; vp.y = 0.f;
+    vp.width = static_cast<float>(swapchainExtent.width);
+    vp.height = static_cast<float>(swapchainExtent.height);
+    vp.minDepth = 0.f; vp.maxDepth = 1.f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+
+    VkRect2D sc{ {0, 0}, swapchainExtent };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+
+    // --- Bind geometry & descriptors ---
     VkDeviceSize offsets[] = { 0 };
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, offsets);
     vkCmdBindIndexBuffer(cmd, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-    // Bind per-frame descriptor set
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
         &descriptorSets[currentFrame], 0, nullptr);
 
-    // Build per-object model matrix and push it
+    // --- Push constants (per-object model) ---
     float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime).count();
     glm::mat4 model = glm::rotate(glm::mat4(1.0f), t, glm::vec3(0.f, 0.f, 1.f));
-
     vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &model);
 
-    // Draw
+    // --- Draw ---
     vkCmdDrawIndexed(cmd, static_cast<uint32_t>(gIndices.size()), 1, 0, 0, 0);
 
     vkCmdEndRendering(cmd);
 
-    // Transition swapchain image to PRESENT for presentation
-    VkImageMemoryBarrier toPresent{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    toPresent.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toPresent.dstAccessMask = 0;
-    toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toPresent.image = swapchainImages[imageIndex];
-    toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    toPresent.subresourceRange.baseMipLevel = 0;
-    toPresent.subresourceRange.levelCount = 1;
-    toPresent.subresourceRange.baseArrayLayer = 0;
-    toPresent.subresourceRange.layerCount = 1;
+    // --- Sync2: transition color to PRESENT ---
+    VkImageMemoryBarrier2 toPresent2{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    toPresent2.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toPresent2.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toPresent2.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+    toPresent2.dstAccessMask = 0;
+    toPresent2.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toPresent2.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toPresent2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toPresent2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toPresent2.image = swapchainImages[imageIndex];
+    toPresent2.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toPresent2.subresourceRange.baseMipLevel = 0;
+    toPresent2.subresourceRange.levelCount = 1;
+    toPresent2.subresourceRange.baseArrayLayer = 0;
+    toPresent2.subresourceRange.layerCount = 1;
 
-    vkCmdPipelineBarrier(
-        cmd,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &toPresent
-    );
+    VkDependencyInfo depEnd{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    depEnd.imageMemoryBarrierCount = 1;
+    depEnd.pImageMemoryBarriers = &toPresent2;
+
+    vkCmdPipelineBarrier2(cmd, &depEnd);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
         throw std::runtime_error("Failed to record command buffer");
@@ -879,6 +956,16 @@ void Renderer::createSyncObjects() {
             vkCreateFence(device, &fence, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create per-frame sync objects");
         }
+
+        // Names for sanity in tools
+        if (pSetName) {
+            VkDebugUtilsObjectNameInfoEXT n{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+            n.objectType = VK_OBJECT_TYPE_SEMAPHORE; n.objectHandle = (uint64_t)imageAvailableSemaphores[i];
+            char labelA[32]; std::snprintf(labelA, sizeof(labelA), "ImgAvail[%d]", i); n.pObjectName = labelA; pSetName(device, &n);
+            n = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+            n.objectType = VK_OBJECT_TYPE_FENCE; n.objectHandle = (uint64_t)inFlightFences[i];
+            char labelF[32]; std::snprintf(labelF, sizeof(labelF), "InFlight[%d]", i); n.pObjectName = labelF; pSetName(device, &n);
+        }
     }
 
     recreatePerImageSemaphores();
@@ -893,6 +980,16 @@ void Renderer::recreatePerImageSemaphores() {
     for (size_t i = 0; i < swapchainImages.size(); ++i) {
         if (vkCreateSemaphore(device, &sem, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS)
             throw std::runtime_error("Failed to create per-image renderFinished semaphore");
+
+        // Name
+        if (pSetName) {
+            VkDebugUtilsObjectNameInfoEXT n{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+            n.objectType = VK_OBJECT_TYPE_SEMAPHORE;
+            n.objectHandle = (uint64_t)renderFinishedSemaphores[i];
+            char label[32]; std::snprintf(label, sizeof(label), "RenderDone[%zu]", i);
+            n.pObjectName = label;
+            pSetName(device, &n);
+        }
     }
     imagesInFlight.assign(swapchainImages.size(), VK_NULL_HANDLE);
 }
@@ -903,9 +1000,6 @@ void Renderer::destroySwapchainObjects() {
             static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
         commandBuffers.clear();
     }
-
-    if (graphicsPipeline) { vkDestroyPipeline(device, graphicsPipeline, nullptr); graphicsPipeline = VK_NULL_HANDLE; }
-    if (pipelineLayout) { vkDestroyPipelineLayout(device, pipelineLayout, nullptr); pipelineLayout = VK_NULL_HANDLE; }
 
     if (depthImageView) { vkDestroyImageView(device, depthImageView, nullptr); depthImageView = VK_NULL_HANDLE; }
     if (depthImage) { vmaDestroyImage(allocator, depthImage, depthAlloc); depthImage = VK_NULL_HANDLE; depthAlloc = VK_NULL_HANDLE; }
@@ -934,8 +1028,7 @@ void Renderer::recreateSwapchain() {
     // --- Rebuild in the correct order ---
     createSwapchain();
     createImageViews();
-    createDepthResources();      // <-- before render pass
-    createGraphicsPipeline();
+    createDepthResources();      // depth before pipeline if rebuild here
 
     createCommandBuffers();
     recreatePerImageSemaphores();
@@ -1110,7 +1203,6 @@ void Renderer::StagingUploader::upload(const void* src, VkDeviceSize sizeBytes, 
     submitAndWait(cmd);
 }
 
-
 void Renderer::copyBuffer(VkBuffer src, VkBuffer dst, VkDeviceSize size) {
     VkCommandBuffer cmd = beginSingleTimeCommands();
     VkBufferCopy copy{ 0, 0, size };
@@ -1145,7 +1237,6 @@ void Renderer::createVertexBuffer() {
     uploader.upload(gVertices.data(), size, vertexBuffer, 0);
 }
 
-
 void Renderer::createIndexBuffer() {
     const VkDeviceSize size = sizeof(uint16_t) * gIndices.size();
 
@@ -1156,7 +1247,6 @@ void Renderer::createIndexBuffer() {
     // Upload from reusable staging
     uploader.upload(gIndices.data(), size, indexBuffer, 0);
 }
-
 
 void Renderer::createUniformBuffers() {
     const VkDeviceSize size = sizeof(UniformBufferObject);
@@ -1195,7 +1285,6 @@ void Renderer::updateUniformBuffer(uint32_t /*imageIndex*/) {
     vmaFlushAllocation(allocator, uniformAllocs[idx], 0, sizeof(u));
 }
 
-
 void Renderer::createDescriptorSets() {
     descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
@@ -1217,3 +1306,4 @@ void Renderer::createDescriptorSets() {
         vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     }
 }
+
